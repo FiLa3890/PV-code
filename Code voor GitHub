@@ -1,0 +1,182 @@
+#%% Load packages
+import requests
+import json
+import pandas as pd
+import pvlib
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+
+def import_data_from_yrno():
+    url = "https://www.yr.no/api/v0/locations/2-2746609/forecast?language=en"
+
+    headers = {"User-Agent": "weather-test iranova.wybalia@gmail.com"}
+
+    try:
+        r = requests.get(url, headers=headers, timeout = 10)
+
+        r.raise_for_status()
+        print(r.json().keys())
+
+        data = r.json() 
+        short_intervals = data["shortIntervals"]
+
+        hours = []
+
+        for item in short_intervals:
+            hours.append({
+            "Datetime": item["start"], # Start time
+            "FH": item["wind"]["speed"], # Wind speed
+            "T": item["temperature"]["value"], # Temperature
+            "P": item["pressure"]["value"], # Air pressure in hPa
+            "Cloud_total": item["cloudCover"]["value"], # Total cloud cover in %
+            })
+
+        df_weather = pd.DataFrame(hours)
+        df_weather["Datetime"] = pd.to_datetime(df_weather["Datetime"])
+        df_weather = df_weather.sort_values("Datetime").reset_index(drop=True)
+        df_weather.index = df_weather["Datetime"]
+        return df_weather
+
+    except requests.exceptions.RequestException as e:
+        print(f"Fout bij ophalen van weerdata: {e}")
+        return None
+    
+    except KeyError as e:
+        print(f"Onverwachte JSON-structuur, ontbrekende sleutel: {e}")
+        return None
+
+def estimate_ghi():
+    df_weather = import_data_from_yrno()
+
+    lat_company = 51.72434689845494 
+    long_company = 4.574463576262911
+
+    location = pvlib.location.Location(latitude=lat_company, longitude=long_company, tz='Europe/Amsterdam', altitude=0.5)
+    times = pd.DatetimeIndex(df_weather["Datetime"])
+
+    clear_sky = location.get_clearsky(times)
+
+    # Zet de percentages voor low, middle en high cloud cover om in fracties
+    df_weather["Cloud_total"] = df_weather["Cloud_total"]  / 100
+    # Zet Air Pressure van hPa naar Pa
+    df_weather["P"] *= 100
+
+    k1 = 0.05468503181380218
+    k2 = 0.5442888356788648
+    df_weather["T_cloud"] = 1 - k1 * df_weather["Cloud_total"] - k2 * df_weather["Cloud_total"]**2
+    df_weather["T_cloud"] = np.clip(df_weather["T_cloud"], 0, 1)
+
+    df_weather["GHI"] = clear_sky["ghi"] * df_weather["T_cloud"]
+    df_weather["GHI"] = np.clip(df_weather["GHI"], 0, clear_sky["ghi"])
+
+    return df_weather
+
+def performance_SP(df_weather, series_datetime):
+    # Scale all weather variables to the prefered unity
+    
+    # Company's information
+    lat_company = 51.72434689845494 
+    long_company = 4.574463576262911
+    directions = ["East", "West", "South"]
+    panel_directions = {"East":120, "West": 120, "South": 216}
+    area_panel = 1.762 * 1.134 
+    A_PV = {key: item * area_panel for key, item in panel_directions.items()}
+    n_cells = 108
+    dict_azimuth = {"East": 99.46817779541016, "West": 279.46817779541016, "South": 112.010753631591797} 
+    dict_tilt = {"East": 22.473342895507813, "West": 22.473342895507813, "South": 22.010753631591797} 
+    module_height = {"East": 8.2, "West": 8.2, "South": 9.1}
+    
+    # Degration of solar panels: t=0 1% and t = 1,...,29 0.4%
+    degration_sp = pd.Series(np.where(series_datetime < "2026-07-03", 0.986, 0.982), index = series_datetime)
+    
+    # Create a dataframe with for every hour the altitude, azimuth, zenith (applies for all panel directions)
+    df_elevation = pd.DataFrame(index = series_datetime, columns = ["Altitude", "Azimuth", "Zenith"])
+    position_sun = pvlib.solarposition.get_solarposition(time = series_datetime, latitude = lat_company, longitude = long_company, temperature=df_weather["T"].to_numpy(), pressure = df_weather["P"].to_numpy())
+    df_elevation = position_sun.rename(columns = {"elevation": "Altitude", "azimuth": "Azimuth", "zenith": "Zenith"})[["Altitude", "Azimuth", "Zenith"]]
+    df_weather["DNI"] = pvlib.irradiance.dirint(ghi = df_weather["GHI"].to_numpy(), solar_zenith = df_elevation["Zenith"].to_numpy(), times = series_datetime, pressure = df_weather["P"].to_numpy())
+    
+    theta_z_rad = np.radians(df_elevation["Zenith"])
+    df_weather["DHI"] = df_weather["GHI"] - df_weather["DNI"] * np.cos(theta_z_rad)
+    df_weather["DHI"] = df_weather["DHI"].clip(lower=0)
+    df_weather["Extra_DNI"] = pvlib.irradiance.get_extra_radiation(series_datetime)
+    df_weather.index = pd.to_datetime(series_datetime)
+    
+    # Create the dataframes for the important parts
+    power_PV = pd.DataFrame(np.nan, index = series_datetime, columns = directions)
+    #G_PoA is the intensity of sunlight received on the geometric plane in which the PV modules are oriented
+    G_PoA =pd.DataFrame(np.nan, index = series_datetime, columns = directions)
+    eta_PV = pd.DataFrame(np.nan, index = series_datetime, columns = directions)
+    # eta_soiling = pd.DataFrame(np.nan, index = series_datetime, columns = ["eta_soiling", "RFP"])
+
+    eta_shading = 1 # No shading
+    eta_reflectance = 0.96 # Schepel
+    
+    # Compute eta_soiling 
+    SF = 0.083 / 100 # Schepel           
+    eta_soiling = 1 - SF # Aangepast!
+
+    eta_cable = 0.985 # Manual
+    eta_MM = 0.985 # Schepel
+    eta_MPPT = 0.9685 # Schepel
+    eta_inv = 0.987 # Manual
+        
+    I_SC_GSTC = 14.35
+    G_STC = 1000
+    
+    # Calculate Fill factor
+    V_mp = 32.4
+    I_mp = 13.58
+    V_oc = 38.98
+    FF = (V_mp * I_mp) / (V_oc * I_SC_GSTC)
+
+    n = 1.5 # Assumption as no information available except "normally lies between 1 and 2"
+    k_b = 1.38e-23
+    T = 298.15
+    q = 1.602e-19
+    VOC_cell_GTC = V_oc / n_cells
+    eta_M_TSTC_GSTC = 0.2202
+    mod_temp_coef = eta_M_TSTC_GSTC * 0.29 / 100
+        
+    for key in directions:
+        # Section 3.2
+        # G_PoA_incident = G_beam + G_PoA_diffuse + G_albedo
+        G_Beam = pvlib.irradiance.beam_component(surface_tilt = dict_tilt[key], surface_azimuth = dict_azimuth[key], solar_zenith = df_elevation["Zenith"], solar_azimuth = df_elevation["Azimuth"], dni = df_weather["DNI"] )
+        G_PoA_diffuse = pvlib.irradiance.reindl(surface_tilt = dict_tilt[key], surface_azimuth = dict_azimuth[key], dhi = df_weather["DHI"], dni = df_weather["DNI"],  \
+            ghi = df_weather["GHI"], dni_extra = df_weather["Extra_DNI"], \
+            solar_zenith = df_elevation["Zenith"], solar_azimuth = df_elevation["Azimuth"])
+        G_albedo = pvlib.irradiance.get_ground_diffuse(surface_tilt = dict_tilt[key], ghi = df_weather["GHI"], albedo = 0.15)
+        G_PoA_incident = G_Beam + G_PoA_diffuse + G_albedo
+        
+        G_PoA[key] = G_PoA_incident * eta_shading * eta_reflectance * eta_soiling
+        
+        # Section 3.3
+        # eta_PV = eta_M(T_M,G_PoA) * eta_cable * eta_MM * eta_MPPT * eta_inv
+        I_SC_GPoA = G_PoA[key].divide(G_STC).multiply(I_SC_GSTC)
+        VOC_cell_GPoA = VOC_cell_GTC + (np.log((G_PoA[key].astype(float).divide(G_STC)).clip(lower=1e-6)).multiply((n*k_b*T)/q))
+        V_OC = VOC_cell_GPoA.multiply(n_cells * panel_directions[key])
+        eta_M_T_STC_G_PoA = ((I_SC_GPoA * V_OC * FF) / ( (G_PoA[key] * A_PV[key]).replace(0, np.nan))).fillna(0)
+    
+        G_PoA_nan = G_PoA.fillna(0)
+        T_M = pvlib.temperature.fuentes(poa_global = G_PoA_nan[key], temp_air= df_weather["T"], wind_speed = df_weather["FH"], \
+                                             noct_installed = 45, module_height = module_height[key], surface_tilt = dict_tilt[key], module_width = 1.134, module_length = 1.762)
+        eta_M_T_M_G_STC = eta_M_TSTC_GSTC - (mod_temp_coef * (T_M - 25))
+        eta_M_TM_GPoA = eta_M_T_STC_G_PoA * eta_M_TSTC_GSTC / eta_M_T_M_G_STC
+
+        eta_PV[key] = eta_M_TM_GPoA * eta_cable * eta_MM * eta_MPPT * eta_inv
+        power_PV[key] = G_PoA[key] * eta_PV[key] * A_PV[key] * degration_sp
+    
+    # Find the generated power 
+    PV_portal = pd.DataFrame(np.nan, index = series_datetime, columns = ["Connection_1"]) 
+    PV_portal.loc[:, "Connection_1"] = ((power_PV["South"] + power_PV["East"] + power_PV["West"]) / 1000)
+    PV_portal = PV_portal.fillna(0) # All values at night nan -> 0
+    return PV_portal
+
+df_weather = estimate_ghi()
+estimated_solar_energy = performance_SP(df_weather, pd.DatetimeIndex(df_weather["Datetime"]))
+# print(estimated_solar_energy)
+# plt.plot(df_weather["Datetime"], estimated_solar_energy["Connection_1"])
+
+
+
+# %%

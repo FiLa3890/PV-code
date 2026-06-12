@@ -91,7 +91,6 @@ def performance_SP(df_weather, series_datetime):
     degration_sp = pd.Series(np.where(series_datetime < "2026-07-03", 0.986, 0.982), index = series_datetime)
     
     # Create a dataframe with for every hour the altitude, azimuth, zenith (applies for all panel directions)
-    df_elevation = pd.DataFrame(index = series_datetime, columns = ["Altitude", "Azimuth", "Zenith"])
     position_sun = pvlib.solarposition.get_solarposition(time = series_datetime, latitude = lat_company, longitude = long_company, temperature=df_weather["T"].to_numpy(), pressure = df_weather["P"].to_numpy())
     df_elevation = position_sun.rename(columns = {"elevation": "Altitude", "azimuth": "Azimuth", "zenith": "Zenith"})[["Altitude", "Azimuth", "Zenith"]]
     df_weather["DNI"] = pvlib.irradiance.dirint(ghi = df_weather["GHI"].to_numpy(), solar_zenith = df_elevation["Zenith"].to_numpy(), times = series_datetime, pressure = df_weather["P"].to_numpy())
@@ -120,6 +119,7 @@ def performance_SP(df_weather, series_datetime):
     eta_MM = 0.985 # Schepel
     eta_MPPT = 0.9685 # Schepel
     eta_inv = 0.987 # Manual
+    eta_balance = eta_cable * eta_MM * eta_MPPT * eta_inv 
         
     I_SC_GSTC = 14.35
     G_STC = 1000
@@ -134,6 +134,7 @@ def performance_SP(df_weather, series_datetime):
     k_b = 1.38e-23
     T = 298.15
     q = 1.602e-19
+    factor1 = (n*k_b*T)/q
     VOC_cell_GTC = V_oc / n_cells
     eta_M_TSTC_GSTC = 0.2202
     mod_temp_coef = eta_M_TSTC_GSTC * 0.29 / 100
@@ -152,31 +153,28 @@ def performance_SP(df_weather, series_datetime):
         
         # Section 3.3
         # eta_PV = eta_M(T_M,G_PoA) * eta_cable * eta_MM * eta_MPPT * eta_inv
-        I_SC_GPoA = G_PoA[key].divide(G_STC).multiply(I_SC_GSTC)
-        VOC_cell_GPoA = VOC_cell_GTC + (np.log((G_PoA[key].astype(float).divide(G_STC)).clip(lower=1e-6)).multiply((n*k_b*T)/q))
+        I_SC_GPoA = G_PoA[key] * I_SC_GSTC / G_STC
+        VOC_cell_GPoA = VOC_cell_GTC + (np.log((G_PoA[key].astype(float).divide(G_STC)).clip(lower=1e-6))) * factor1
         V_OC = VOC_cell_GPoA.multiply(n_cells * panel_directions[key])
         eta_M_T_STC_G_PoA = ((I_SC_GPoA * V_OC * FF) / ( (G_PoA[key] * A_PV[key]).replace(0, np.nan))).fillna(0)
     
-        G_PoA_nan = G_PoA.fillna(0)
-        T_M = pvlib.temperature.fuentes(poa_global = G_PoA_nan[key], temp_air= df_weather["T"], wind_speed = df_weather["FH"], \
+        G_PoA_nan = G_PoA[key].fillna(0)
+        T_M = pvlib.temperature.fuentes(poa_global = G_PoA_nan, temp_air= df_weather["T"], wind_speed = df_weather["FH"], \
                                              noct_installed = 45, module_height = module_height[key], surface_tilt = dict_tilt[key], module_width = 1.134, module_length = 1.762)
         eta_M_T_M_G_STC = eta_M_TSTC_GSTC - (mod_temp_coef * (T_M - 25))
         eta_M_TM_GPoA = eta_M_T_STC_G_PoA * eta_M_TSTC_GSTC / eta_M_T_M_G_STC
 
-        eta_PV[key] = eta_M_TM_GPoA * eta_cable * eta_MM * eta_MPPT * eta_inv
+        eta_PV[key] = eta_M_TM_GPoA * eta_balance
         power_PV[key] = G_PoA[key] * eta_PV[key] * A_PV[key] * degration_sp
     
     # Find the generated power 
     PV_portal = pd.DataFrame(np.nan, index = series_datetime, columns = ["Connection_1"]) 
-    PV_portal.loc[:, "Connection_1"] = ((power_PV["South"] + power_PV["East"] + power_PV["West"]) / 1000)
+    PV_portal.loc[:, "Connection_1"] = (power_PV[["South", "East", "West"]].sum(axis = 1) / 1000)
     PV_portal = PV_portal.fillna(0) # All values at night nan -> 0
     return PV_portal
 
 df_weather = estimate_ghi()
 estimated_solar_energy = performance_SP(df_weather, pd.DatetimeIndex(df_weather["Datetime"]))
 # print(estimated_solar_energy)
-# plt.plot(df_weather["Datetime"], estimated_solar_energy["Connection_1"])
+plt.plot(df_weather["Datetime"], estimated_solar_energy["Connection_1"])
 
-
-
-# %%

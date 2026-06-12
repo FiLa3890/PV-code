@@ -5,7 +5,6 @@ import pandas as pd
 import pvlib
 import numpy as np
 from sklearn.linear_model import LinearRegression
-import matplotlib.pyplot as plt
 
 def import_data_from_yrno():
     url = "https://www.yr.no/api/v0/locations/2-2746609/forecast?language=en"
@@ -176,5 +175,5 @@ def performance_SP(df_weather, series_datetime):
 df_weather = estimate_ghi()
 estimated_solar_energy = performance_SP(df_weather, pd.DatetimeIndex(df_weather["Datetime"]))
 # print(estimated_solar_energy)
-# plt.plot(df_weather["Datetime"], estimated_solar_energy["Connection_1"])
+
 

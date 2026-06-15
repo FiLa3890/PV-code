@@ -174,6 +174,6 @@ def performance_SP(df_weather, series_datetime):
 
 df_weather = estimate_ghi()
 estimated_solar_energy = performance_SP(df_weather, pd.DatetimeIndex(df_weather["Datetime"]))
-estimated_solar_energy.to_csv("estimated_pv.csv", index = False)
+estimated_solar_energy.to_csv("estimated_pv.csv", index = True)
 
 
